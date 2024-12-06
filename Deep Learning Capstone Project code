@@ -1,0 +1,211 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader, random_split
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+import numpy as np
+
+class ImageClassificationPipeline:
+    def __init__(self, num_classes=10, batch_size=32, num_epochs=10, learning_rate=0.001):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_classes = num_classes
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.learning_rate = learning_rate
+
+    def load_cifar10(self, num_samples_per_class=1000):
+        # Data augmentation for training
+        train_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.RandomAffine(0, shear=10, scale=(0.8,1.2)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+
+        # Simple transforms for validation/test
+        test_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+
+        # Load CIFAR-10 dataset
+        train_dataset = datasets.CIFAR10(root='./data', train=True,
+                                       download=True, transform=train_transform)
+        test_dataset = datasets.CIFAR10(root='./data', train=False,
+                                      download=True, transform=test_transform)
+
+        # Create class-balanced subset if specified
+        if num_samples_per_class:
+            train_indices = self._get_balanced_subset(train_dataset, num_samples_per_class)
+            train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
+
+        # Split training data into train and validation sets
+        train_size = int(0.8 * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+        # Create data loaders
+        self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size,
+                                     shuffle=True, num_workers=2)
+        self.val_loader = DataLoader(val_dataset, batch_size=self.batch_size,
+                                   shuffle=False, num_workers=2)
+        self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size,
+                                    shuffle=False, num_workers=2)
+
+        self.classes = ('plane', 'car', 'bird', 'cat', 'deer',
+                       'dog', 'frog', 'horse', 'ship', 'truck')
+
+    def _get_balanced_subset(self, dataset, num_samples_per_class):
+        class_counts = torch.zeros(self.num_classes)
+        indices = []
+
+        for idx, (_, label) in enumerate(dataset):
+            if class_counts[label] < num_samples_per_class:
+                indices.append(idx)
+                class_counts[label] += 1
+            if torch.all(class_counts >= num_samples_per_class):
+                break
+
+        return indices
+
+    def create_model(self):
+        # Use ResNet18 as base model
+        self.model = models.resnet18(pretrained=True)
+        # Modify final fully connected layer for our number of classes
+        self.model.fc = nn.Linear(self.model.fc.in_features, self.num_classes)
+        self.model = self.model.to(self.device)
+
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=3)
+
+    def train_model(self):
+        best_val_loss = float('inf')
+        train_losses = []
+        val_losses = []
+
+        for epoch in range(self.num_epochs):
+            # Training phase
+            self.model.train()
+            running_loss = 0.0
+            for inputs, labels in self.train_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                self.optimizer.zero_grad()
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, labels)
+                loss.backward()
+                self.optimizer.step()
+
+                running_loss += loss.item()
+
+            train_loss = running_loss / len(self.train_loader)
+            train_losses.append(train_loss)
+
+            # Validation phase
+            val_loss, val_acc = self.evaluate(self.val_loader)
+            val_losses.append(val_loss)
+
+            print(f'Epoch {epoch+1}/{self.num_epochs}:')
+            print(f'Training Loss: {train_loss:.4f}')
+            print(f'Validation Loss: {val_loss:.4f}')
+            print(f'Validation Accuracy: {val_acc:.2f}%\n')
+
+            # Learning rate scheduling
+            self.scheduler.step(val_loss)
+
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(self.model.state_dict(), 'best_model.pth')
+
+        return train_losses, val_losses
+
+    def evaluate(self, dataloader):
+        self.model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for inputs, labels in dataloader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, labels)
+
+                running_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+
+        accuracy = 100. * correct / total
+        avg_loss = running_loss / len(dataloader)
+
+        return avg_loss, accuracy
+
+    def test_model(self):
+        # Load best model
+        self.model.load_state_dict(torch.load('best_model.pth'))
+        test_loss, test_acc = self.evaluate(self.test_loader)
+        print(f'Test Loss: {test_loss:.4f}')
+        print(f'Test Accuracy: {test_acc:.2f}%')
+
+        # Generate confusion matrix
+        all_preds = []
+        all_labels = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for inputs, labels in self.test_loader:
+                inputs = inputs.to(self.device)
+                outputs = self.model(inputs)
+                _, predicted = outputs.max(1)
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.numpy())
+
+        cm = confusion_matrix(all_labels, all_preds)
+        return cm, test_acc
+
+    def plot_results(self, train_losses, val_losses, confusion_mat):
+        # Plot training curves
+        plt.figure(figsize=(10, 5))
+        plt.plot(train_losses, label='Training Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('Training and Validation Loss')
+        plt.show()
+
+        # Plot confusion matrix
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(confusion_mat, annot=True, fmt='d', cmap='Blues',
+                   xticklabels=self.classes, yticklabels=self.classes)
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.title('Confusion Matrix')
+        plt.show()
+
+# Initialize and run the pipeline
+pipeline = ImageClassificationPipeline(num_classes=10, batch_size=32,
+                                     num_epochs=10, learning_rate=0.001)
+
+# Load and preprocess data
+pipeline.load_cifar10(num_samples_per_class=1000)
+
+# Create and train model
+pipeline.create_model()
+train_losses, val_losses = pipeline.train_model()
+
+# Test model and visualize results
+confusion_mat, test_accuracy = pipeline.test_model()
+pipeline.plot_results(train_losses, val_losses, confusion_mat)
+
+print(f"Final Test Accuracy: {test_accuracy:.2f}%")
